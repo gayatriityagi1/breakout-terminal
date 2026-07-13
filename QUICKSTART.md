@@ -19,11 +19,19 @@ pip install -r requirements.txt        # pandas MUST be <3 (pinned)
 
 ## 2. Get the database
 
-The warehouse (`database/breakout.duckdb`, ~700 MB) is **not in git** — it is
-far over GitHub's file limit. Place the provided `breakout.duckdb` at
-`database/breakout.duckdb` (it is shared out-of-band, not in this repo). To
-distribute it yourself, use Git LFS or a release asset. To rebuild it from raw
-data, see step "Rebuilding scores" below.
+The warehouse (`database/breakout.duckdb`, ~678 MB) is **not in git** — it is
+far over GitHub's file limit. It is attached as a **release asset**:
+
+1. Go to the repo's **Releases** → **"Warehouse database (breakout.duckdb)"** (tag `data-v1`).
+2. Download `breakout.duckdb` and place it at `database/breakout.duckdb`.
+
+Or from the CLI:
+
+```bash
+gh release download data-v1 --repo <owner>/breakout-terminal --dir database
+```
+
+To rebuild it from raw data instead, see "Rebuilding scores" below.
 
 ## 3. Run the terminal
 
