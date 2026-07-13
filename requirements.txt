@@ -1,0 +1,13 @@
+# RECOMMENDED PYTHON: 3.11 or 3.12. On Python 3.14 the native pyarrow/duckdb
+# stack is unstable under very rapid Streamlit reruns (can segfault). Normal
+# human-paced use is fine; a 3.11/3.12 venv removes the risk entirely.
+duckdb>=0.10.0
+# pandas pinned <3: pandas 3.x's Arrow-backed dtypes segfault Streamlit 1.59's
+# DataFrame serialization on this stack. 2.x is stable.
+pandas>=2.0.0,<3
+numpy>=1.24.0
+yfinance>=0.2.40
+requests>=2.31.0
+streamlit>=1.32.0
+plotly>=5.20.0
+apscheduler>=3.10.0

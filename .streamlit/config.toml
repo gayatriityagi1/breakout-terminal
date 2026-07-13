@@ -1,0 +1,18 @@
+# Institutional terminal theme — dark, so the built-in dataframe grid,
+# widgets and menus inherit the palette instead of the default light look.
+[theme]
+base = "dark"
+primaryColor = "#e8a13a"
+backgroundColor = "#0a0d12"
+secondaryBackgroundColor = "#0f141b"
+textColor = "#c6d0dc"
+font = "monospace"
+
+[server]
+headless = true
+# runOnSave off: hot-reload while a render/DuckDB query is in flight can crash
+# the native pyarrow/duckdb layer on this Python build. Restart to pick up edits.
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
