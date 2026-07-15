@@ -142,7 +142,12 @@ def layer_asof_date(schema, table, asof):
 
 
 def layer_board(layer, d, sector=None, min_score=0.0, limit=500, desc=True):
-    """Leaderboard for a per-stock layer at date d, joined to raw.stocks."""
+    """Leaderboard for a per-stock layer at date d, joined to raw.stocks.
+
+    Quarterly layers (L3) ASOF-join each stock to its own latest report on
+    or before d, since stocks report on staggered dates — a plain `date = d`
+    filter would only match the few stocks whose latest report happens to
+    fall exactly on the universe-wide max date."""
     schema, table = layer["table"]
     if not db.rowcount(schema, table):
         return pd.DataFrame()
@@ -150,13 +155,33 @@ def layer_board(layer, d, sector=None, min_score=0.0, limit=500, desc=True):
     cols = [score] + [c for c, *_ in layer["raws"]] + [c for c, *_ in layer.get("subs", [])]
     cols = list(dict.fromkeys(cols))  # dedupe, keep order
     col_sql = ", ".join(f"f.{c}" for c in cols)
+    direction = "DESC" if desc else "ASC"
+
+    if layer.get("quarterly"):
+        where = [f"f.{score} >= ?"]
+        params = [float(min_score)]
+        if sector and sector != "All sectors":
+            where.append("u.sector = ?")
+            params.append(sector)
+        params.append(int(limit))
+        return db.q(
+            f"""WITH u AS (SELECT stock_id, symbol, sector, ? AS asof_date FROM raw.stocks)
+                SELECT u.symbol, u.sector, {col_sql}
+                FROM u
+                ASOF LEFT JOIN {schema}.{table} f
+                    ON u.stock_id = f.stock_id AND u.asof_date >= f.date
+                WHERE {' AND '.join(where)}
+                ORDER BY f.{score} {direction} NULLS LAST
+                LIMIT ?""",
+            [d] + params,
+        )
+
     where = ["f.date = ?", f"f.{score} >= ?"]
     params = [d, float(min_score)]
     if sector and sector != "All sectors":
         where.append("s.sector = ?")
         params.append(sector)
     params.append(int(limit))
-    direction = "DESC" if desc else "ASC"
     return db.q(
         f"""SELECT s.symbol, s.sector, {col_sql}
             FROM {schema}.{table} f
@@ -176,11 +201,21 @@ def layer_stat(layer, d):
     score = layer["score_col"]
     extra = ""
     if layer.get("flag_col"):
-        extra = f", SUM(CASE WHEN {layer['flag_col']} THEN 1 ELSE 0 END) AS flag_count"
-    row = db.q(
-        f"SELECT COUNT(*) n, AVG({score}) avg_score, MAX({score}) max_score{extra} "
-        f"FROM {schema}.{table} WHERE date = ?", [d]
-    )
+        extra = f", SUM(CASE WHEN f.{layer['flag_col']} THEN 1 ELSE 0 END) AS flag_count"
+
+    if layer.get("quarterly"):
+        row = db.q(
+            f"""WITH u AS (SELECT stock_id, ? AS asof_date FROM raw.stocks)
+                SELECT COUNT(f.{score}) n, AVG(f.{score}) avg_score, MAX(f.{score}) max_score{extra}
+                FROM u ASOF LEFT JOIN {schema}.{table} f
+                    ON u.stock_id = f.stock_id AND u.asof_date >= f.date""",
+            [d],
+        )
+    else:
+        row = db.q(
+            f"SELECT COUNT(*) n, AVG(f.{score}) avg_score, MAX(f.{score}) max_score{extra} "
+            f"FROM {schema}.{table} f WHERE f.date = ?", [d]
+        )
     return None if row.empty else row.iloc[0].to_dict()
 
 
@@ -249,7 +284,17 @@ def layer_score_distribution(layer, d):
     if not db.rowcount(schema, table):
         return []
     score = layer["score_col"]
-    df = db.q(f"SELECT {score} AS s FROM {schema}.{table} WHERE date = ? AND {score} IS NOT NULL", [d])
+    if layer.get("quarterly"):
+        df = db.q(
+            f"""WITH u AS (SELECT stock_id, ? AS asof_date FROM raw.stocks)
+                SELECT f.{score} AS s
+                FROM u ASOF LEFT JOIN {schema}.{table} f
+                    ON u.stock_id = f.stock_id AND u.asof_date >= f.date
+                WHERE f.{score} IS NOT NULL""",
+            [d],
+        )
+    else:
+        df = db.q(f"SELECT {score} AS s FROM {schema}.{table} WHERE date = ? AND {score} IS NOT NULL", [d])
     return df["s"].tolist()
 
 
@@ -259,6 +304,17 @@ def layer_sector_avg(layer, d):
     if not db.rowcount(schema, table):
         return pd.DataFrame()
     score = layer["score_col"]
+    if layer.get("quarterly"):
+        return db.q(
+            f"""WITH u AS (SELECT stock_id, sector, ? AS asof_date FROM raw.stocks)
+                SELECT u.sector, AVG(f.{score}) AS avg_score, COUNT(f.{score}) AS n
+                FROM u ASOF LEFT JOIN {schema}.{table} f
+                    ON u.stock_id = f.stock_id AND u.asof_date >= f.date
+                WHERE u.sector IS NOT NULL
+                GROUP BY u.sector HAVING COUNT(f.{score}) >= 3
+                ORDER BY avg_score DESC""",
+            [d],
+        )
     return db.q(
         f"""SELECT s.sector, AVG(f.{score}) AS avg_score, COUNT(*) AS n
             FROM {schema}.{table} f JOIN raw.stocks s ON s.stock_id = f.stock_id

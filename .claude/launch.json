@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "terminal",
-      "runtimeExecutable": "/Users/gayatri/Downloads/breakout-master-features/.venv/bin/streamlit",
+      "runtimeExecutable": "/Users/gayatri/breakout-terminal/.venv/bin/streamlit",
       "runtimeArgs": ["run", "frontend/terminal.py", "--server.port", "8501", "--server.headless", "true"],
       "port": 8501
     }

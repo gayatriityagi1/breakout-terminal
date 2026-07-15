@@ -58,12 +58,8 @@ def _status_strip(d):
     else:
         _tile(cols[1], L2, "—", T.DIM, "no data", T.LINE)
 
-    # L3 fundamental (empty)
-    L3 = BY_KEY["fundamental"]
-    _tile(cols[2], L3, "N/A", T.DIM, C.tag("NO SOURCE DATA", T.AMBER), T.AMBER_DIM)
-
-    # L4 accumulation, L5 technical, L7 risk — avg over universe
-    for idx, key in ((3, "accumulation"), (4, "technical")):
+    # L3 fundamental, L4 accumulation, L5 technical — avg over universe
+    for idx, key in ((2, "fundamental"), (3, "accumulation"), (4, "technical")):
         L = BY_KEY[key]
         s = Q.layer_stat(L, d)
         if s and s.get("avg_score") is not None:

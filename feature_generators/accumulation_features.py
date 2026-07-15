@@ -23,7 +23,7 @@ from database.db_utils import get_connection, upsert_dataframe
 from indicators import accumulation as acc
 
 
-def compute_for_all_stocks(symbol_filter=None, progress_callback=None):
+def compute_for_all_stocks(symbol_filter=None, progress_callback=None, since_date=None):
 
     def log(msg):
         if progress_callback:
@@ -94,6 +94,11 @@ def compute_for_all_stocks(symbol_filter=None, progress_callback=None):
             feats.insert(1, "date", feats.index.date)
 
             feats = feats.reset_index(drop=True)
+
+            if since_date is not None:
+                feats = feats[feats["date"] >= since_date]
+                if feats.empty:
+                    continue
 
             n = upsert_dataframe(
                 con,

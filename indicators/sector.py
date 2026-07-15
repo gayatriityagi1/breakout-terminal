@@ -1,272 +1,190 @@
 # -*- coding: utf-8 -*-
 """
-sector.py
+sector.py — Layer 2, Sector Strength.
 
-Sector feature calculations.
+Full redesign: the old version scored a sector using raw.sector_data
+(an external index feed that turned out to be a one-time seed, dead
+since 2024-12-31, with no live source). This version needs nothing
+external — every input is derived from raw.stocks.sector membership
+against raw.daily_prices / analytics.close_matrix, raw.market_data,
+features.fundamental_features, and raw.shareholding.
 
-Input:
-    DataFrame indexed by date containing at least:
+Six components, weighted to sum to 100 (matches the existing
+sector_score 0-100 convention that scoring_engine.py already halves
+to /50 for the blended Final System Output — nothing downstream needs
+to change):
 
-    close
-    volume
+    1. Relative Strength      /20   sector return vs NIFTY, 1M/3M/6M blend
+    2. Momentum                /20   ROC20/50 + EMA20/50 slope (acceleration)
+    3. Breadth                 /20   % of sector's stocks above 20/50/200 DMA
+    4. Leadership               /16   top-N stocks by size: %above50dma,
+                                       %fresh highs, %outperforming NIFTY
+    5. Earnings Strength        /14   avg EPS/revenue growth, ROE, margin trend
+    6. Institutional Participation /10  QoQ change in FII% / Mutual Fund% holding
 
-Output:
-    DataFrame containing sector features.
+All the per-date, per-sector aggregation (building the equal-weighted
+sector index, breadth matrices, etc.) lives in sector_features.py —
+this module is just the scoring math, kept separate the same way
+risk.py / accumulation.py / trigger.py separate "compute the raw
+signal" from "score the signal".
 """
 
 import numpy as np
 import pandas as pd
 
 
-# ==========================================================
+# ------------------------------------------------------------
 # Helpers
-# ==========================================================
+# ------------------------------------------------------------
 
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def roc(series, period):
+    return (series / series.shift(period) - 1) * 100
+
+
+def rolling_slope(series, window=10):
+    """Linear-regression slope of the last `window` points, normalized
+    by the series' own level so it's a %-per-day figure comparable
+    across sectors trading at different index levels."""
+    x = np.arange(window)
+    out = np.full(len(series), np.nan)
+    values = series.values
+    for i in range(window - 1, len(series)):
+        y = values[i - window + 1:i + 1]
+        if np.isnan(y).any() or y[-1] == 0:
+            continue
+        slope = np.polyfit(x, y, 1)[0]
+        out[i] = slope / abs(y[-1]) * 100
+    return pd.Series(out, index=series.index)
 
 
 def rsi(close, period=14):
-
     delta = close.diff()
-
     gain = delta.clip(lower=0)
-
     loss = -delta.clip(upper=0)
-
     avg_gain = gain.rolling(period).mean()
-
     avg_loss = loss.rolling(period).mean()
-
     rs = avg_gain / avg_loss.replace(0, np.nan)
-
     return 100 - (100 / (1 + rs))
 
 
-# ==========================================================
-# Returns
-# ==========================================================
+# ------------------------------------------------------------
+# 1. Relative Strength (/20)
+# ------------------------------------------------------------
 
-def return_1d(df):
-
-    return df["close"].pct_change()
-
-
-def return_5d(df):
-
-    return df["close"].pct_change(5)
+def score_relative_strength(rs_1m, rs_3m, rs_6m):
+    """rs_* are (sector return - NIFTY return) over each window, in
+    percentage points. Recent outperformance weighted more heavily."""
+    blended = 0.5 * rs_1m.fillna(0) + 0.3 * rs_3m.fillna(0) + 0.2 * rs_6m.fillna(0)
+    # -15pp to +25pp underperformance/outperformance mapped to 0-20
+    return ((blended.clip(-15, 25) + 15) / 40 * 20).clip(0, 20)
 
 
-def return_20d(df):
+# ------------------------------------------------------------
+# 2. Momentum (/20) — is the sector accelerating, not just rising
+# ------------------------------------------------------------
 
-    return df["close"].pct_change(20)
+def score_momentum(roc20, roc50, ema20_slope, ema50_slope):
+    score = pd.Series(0.0, index=roc20.index)
 
+    # Acceleration: 20d ROC outpacing 50d ROC means the recent trend
+    # is stronger than the longer trend — classic acceleration signal.
+    accelerating = (roc20 > roc50).astype(float)
+    score += accelerating * 6
 
-def return_50d(df):
+    # Raw ROC20 magnitude, capped
+    score += (roc20.clip(-10, 20).fillna(0) + 10) / 30 * 7
 
-    return df["close"].pct_change(50)
+    # EMA slopes positive = trending up, weighted toward the faster EMA
+    score += (ema20_slope > 0).fillna(False).astype(float) * 4
+    score += (ema50_slope > 0).fillna(False).astype(float) * 3
 
-
-# ==========================================================
-# Trend
-# ==========================================================
-
-def trend_score(df):
-
-    ema20 = ema(df["close"], 20)
-
-    ema50 = ema(df["close"], 50)
-
-    ema200 = ema(df["close"], 200)
-
-    score = pd.Series(0.0, index=df.index)
-
-    score += (df["close"] > ema20).astype(float)
-
-    score += (ema20 > ema50).astype(float)
-
-    score += (ema50 > ema200).astype(float)
-
-    score += (df["close"] > ema200).astype(float)
-
-    return score * 25
+    return score.clip(0, 20)
 
 
-# ==========================================================
-# Momentum
-# ==========================================================
+# ------------------------------------------------------------
+# 3. Breadth (/20) — participation, not just the index level
+# ------------------------------------------------------------
 
-def momentum_score(df):
+def score_breadth(pct_above_20dma, pct_above_50dma, pct_above_200dma):
+    # 50 DMA (intermediate strength) weighted highest — the classic
+    # "is the sector's move broad-based" read; 200 DMA anchors the
+    # long-term picture, 20 DMA is noisiest so weighted least.
+    blended = (
+        0.25 * pct_above_20dma.fillna(0) +
+        0.45 * pct_above_50dma.fillna(0) +
+        0.30 * pct_above_200dma.fillna(0)
+    )
+    return (blended / 100 * 20).clip(0, 20)
 
-    r = rsi(df["close"])
 
-    score = pd.Series(50.0, index=df.index)
+# ------------------------------------------------------------
+# 4. Leadership (/16) — are the sector's biggest names actually strong
+# ------------------------------------------------------------
 
-    score += (r - 50)
+def score_leadership(frac_above_50dma, frac_fresh_high, frac_outperforming):
+    blended = (
+        0.4 * frac_above_50dma.fillna(0) +
+        0.3 * frac_fresh_high.fillna(0) +
+        0.3 * frac_outperforming.fillna(0)
+    )
+    return (blended * 16).clip(0, 16)
 
-    return score.clip(0, 100)
+
+# ------------------------------------------------------------
+# 5. Earnings Strength (/14) — fundamentals, not just price action
+# ------------------------------------------------------------
+
+def score_earnings_strength(avg_eps_growth, avg_revenue_growth, avg_margin_change, avg_roe):
+    score = pd.Series(0.0, index=avg_eps_growth.index)
+
+    # EPS growth: -20% to +40% mapped to 0-4
+    score += ((avg_eps_growth.clip(-20, 40).fillna(0) + 20) / 60 * 4)
+    # Revenue growth: -10% to +30% mapped to 0-3
+    score += ((avg_revenue_growth.clip(-10, 30).fillna(0) + 10) / 40 * 3)
+    # Margin expansion (pp change): -3 to +3 mapped to 0-3
+    score += ((avg_margin_change.clip(-3, 3).fillna(0) + 3) / 6 * 3)
+    # ROE: 0-30% mapped to 0-4
+    score += (avg_roe.clip(0, 30).fillna(0) / 30 * 4)
+
+    return score.clip(0, 14)
 
 
-# ==========================================================
-# Relative Strength
-# ==========================================================
+# ------------------------------------------------------------
+# 6. Institutional Participation (/10)
+# ------------------------------------------------------------
 
-def relative_strength(df):
+def score_institutional(avg_fii_change, avg_mf_change):
+    score = pd.Series(0.0, index=avg_fii_change.index)
+    # QoQ percentage-point change in holding; -2pp to +2pp mapped to 0-5 each
+    score += ((avg_fii_change.clip(-2, 2).fillna(0) + 2) / 4 * 5)
+    score += ((avg_mf_change.clip(-2, 2).fillna(0) + 2) / 4 * 5)
+    return score.clip(0, 10)
 
-    rs = (
-        0.40 * return_20d(df)
-        +
-        0.30 * return_50d(df)
-        +
-        0.20 * return_5d(df)
-        +
-        0.10 * return_1d(df)
+
+# ------------------------------------------------------------
+# Label
+# ------------------------------------------------------------
+
+def classify_sector_label(score):
+    return np.select(
+        [score >= 75, score >= 55, score >= 35],
+        ["Strong Leading Sector", "Leading Sector", "Neutral / Rotating Sector"],
+        default="Weak / Lagging Sector",
     )
 
-    return rs
 
+# ------------------------------------------------------------
+# Composite
+# ------------------------------------------------------------
 
-# ==========================================================
-# Volume Trend
-# ==========================================================
-
-def volume_score(df):
-
-    avg20 = df["volume"].rolling(20).mean()
-
-    avg50 = df["volume"].rolling(50).mean()
-
-    score = pd.Series(0.0, index=df.index)
-
-    score += (avg20 > avg50).astype(float)
-
-    score += (df["volume"] > avg20).astype(float)
-
-    return score * 50
-# ==========================================================
-# Sector Rank
-# ==========================================================
-
-def compute_sector_rank(features):
-    """
-    Rank sectors based on relative strength.
-    Higher RS = Better Rank.
-
-    NOTE:
-    The actual ranking across all sectors is done in
-    feature_generators/sector_features.py.
-    Here we simply expose RS as the ranking metric.
-    """
-
-    return features["relative_strength"]
-
-
-# ==========================================================
-# Sector Strength
-# ==========================================================
-
-def compute_sector_strength(features):
-    """
-    Composite sector strength.
-
-    Combines:
-        Trend
-        Momentum
-        Relative Strength
-        Volume
-
-    Returns:
-        0–100
-    """
-
-    rs = features["relative_strength"]
-
-    rs_norm = (
-        rs - rs.rolling(252).min()
-    ) / (
-        rs.rolling(252).max() -
-        rs.rolling(252).min()
+def compute_composite(rs_score, momentum_score, breadth_score,
+                       leadership_score, earnings_score, institutional_score):
+    total = (
+        rs_score.fillna(0) + momentum_score.fillna(0) + breadth_score.fillna(0) +
+        leadership_score.fillna(0) + earnings_score.fillna(0) + institutional_score.fillna(0)
     )
-
-    score = (
-        0.35 * features["trend_score"] +
-        0.25 * features["momentum_score"] +
-        0.20 * rs_norm.fillna(0) * 100 +
-        0.20 * features["volume_score"]
-    )
-
-    return score.clip(0, 100)
-
-
-# ==========================================================
-# Final Sector Score
-# ==========================================================
-
-def compute_sector_score(features):
-    """
-    Final Layer-2 score.
-
-    This is what the scoring engine consumes.
-    """
-
-    return compute_sector_strength(features)
-
-
-# ==========================================================
-# Compute All Features
-# ==========================================================
-
-def compute_all(df):
-
-    features = pd.DataFrame(index=df.index)
-
-    # ------------------------------------------------------
-    # Returns
-    # ------------------------------------------------------
-
-    features["return_1d"] = return_1d(df)
-    features["return_5d"] = return_5d(df)
-    features["return_20d"] = return_20d(df)
-    features["return_50d"] = return_50d(df)
-
-    # ------------------------------------------------------
-    # Trend
-    # ------------------------------------------------------
-
-    features["ema20"] = ema(df["close"], 20)
-    features["ema50"] = ema(df["close"], 50)
-    features["ema200"] = ema(df["close"], 200)
-
-    features["trend_score"] = trend_score(df)
-
-    # ------------------------------------------------------
-    # Momentum
-    # ------------------------------------------------------
-
-    features["rsi"] = rsi(df["close"])
-
-    features["momentum_score"] = momentum_score(df)
-
-    # ------------------------------------------------------
-    # Relative Strength
-    # ------------------------------------------------------
-
-    features["relative_strength"] = relative_strength(df)
-
-    # ------------------------------------------------------
-    # Volume
-    # ------------------------------------------------------
-
-    features["volume_score"] = volume_score(df)
-
-    # ------------------------------------------------------
-    # Ranking / Strength
-    # ------------------------------------------------------
-
-    features["sector_rank"] = compute_sector_rank(features)
-
-    features["sector_strength"] = compute_sector_strength(features)
-
-    features["sector_score"] = compute_sector_score(features)
-
-    return features
+    return total.clip(0, 100)

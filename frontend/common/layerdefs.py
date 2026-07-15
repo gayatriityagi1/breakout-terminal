@@ -66,6 +66,13 @@ L3 = dict(
     key="fundamental", no=3, name="Fundamental Strength", scope="stock",
     table=("features", "fundamental_features"), score_col="fundamental_score", max=100, invert=False,
     id_col="stock_id",
+    # Unlike L4-L7 (one row per stock per trading day), each stock reports
+    # on its own quarterly cadence — a single shared `date` filter would only
+    # match the handful of stocks whose latest report happens to land exactly
+    # on the universe-wide MAX(date). Leaderboard/stat/distribution queries
+    # branch on this flag to ASOF-join each stock to its own latest report
+    # on or before the as-of date instead.
+    quarterly=True,
     blurb="Revenue / profit / EPS growth, ROE / ROCE, leverage, promoter holding "
           "& pledge, and valuation.",
     subs=[

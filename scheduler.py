@@ -63,11 +63,21 @@ def run_daily_pipeline():
     """Delegates to update.py — the single source of truth for the
     pipeline (incremental, per-layer failure handling, validation,
     cleanup). Keeping the logic in one place instead of duplicating it
-    here."""
+    here.
+
+    update.py stops at analytics.layer_scores (what app.py's dashboard
+    reads) and deliberately does not touch features.system_scores — the
+    per-stock leaderboard table frontend/terminal.py reads instead. Run
+    that step too so both dashboards stay current off one daily job."""
     print(f"[{datetime.now()}] === Daily pipeline starting (via update.py) ===")
     import update
     update.main()
     print(f"[{datetime.now()}] === Daily pipeline finished ===")
+
+    print(f"[{datetime.now()}] === Computing features.system_scores (frontend/terminal.py leaderboard) ===")
+    import system_scores
+    system_scores.compute_system_scores(progress_callback=print)
+    print(f"[{datetime.now()}] === features.system_scores up to date ===")
 
 
 def start_scheduler():

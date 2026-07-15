@@ -137,6 +137,56 @@ def supertrend(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 
     return pd.DataFrame({"supertrend": st, "supertrend_dir": trend})
 
 
+# ------------------------------------------------------------
+# Layer 5 — Technical Structure composite score
+# ------------------------------------------------------------
+
+def compute_technical_score(out: pd.DataFrame) -> pd.Series:
+    """
+    Composite Technical Structure score (0-100), built from the
+    indicators already computed in `out` (must be called after all
+    the individual indicator columns are populated — see compute_all).
+
+    Weighting rationale:
+      - EMA stack alignment (trend structure)        30
+      - ADX (trend strength, uncapped direction)      15
+      - MACD histogram (momentum confirmation)        15
+      - RSI in a healthy trending zone (50-70)         10
+      - Supertrend direction                           15
+      - Stochastic not extended (avoids late entries)   5
+      - Fresh 252d high                                10
+    """
+    score = pd.Series(0.0, index=out.index)
+
+    # EMA stack: close > ema20 > ema50 > ema150 > ema200 (4 checks x 7.5)
+    score += out["above_ema20"].astype(float) * 7.5
+    score += (out["ema20"] > out["ema50"]).astype(float) * 7.5
+    score += (out["ema50"] > out["ema150"]).astype(float) * 7.5
+    score += out["above_ema200"].astype(float) * 7.5
+
+    # ADX: trend strength, cap at 40
+    score += (out["adx14"].clip(0, 40) / 40).fillna(0) * 15
+
+    # MACD histogram positive = momentum confirming the trend
+    score += (out["macd_hist"] > 0).astype(float) * 15
+
+    # RSI sweet spot (50-70 = healthy uptrend momentum, not yet overbought)
+    rsi_health = ((out["rsi14"] >= 50) & (out["rsi14"] <= 70)).astype(float)
+    score += rsi_health * 10
+
+    # Supertrend direction (1 = bullish)
+    score += (out["supertrend_dir"] == 1).astype(float) * 15
+
+    # Stochastic not overbought (>80 flagged as extended, penalized)
+    not_extended = (out["stoch_k"] <= 80).astype(float)
+    score += not_extended * 5
+
+    # Fresh 52-week high = structurally strong
+    score += out["new_high_252"].astype(float) * 10
+
+    return score.clip(0, 100)
+
+
 def compute_all(df: pd.DataFrame) -> pd.DataFrame:
     """df must have columns: open, high, low, close, volume, indexed by date.
     Returns a DataFrame with exactly the columns of features.technical_features
@@ -209,74 +259,9 @@ def compute_all(df: pd.DataFrame) -> pd.DataFrame:
         out["ema200"]
     )
 
-    out["technical_score"] = technical_score(out)
+    # ==========================================================
+    # Layer 5 final score
+    # ==========================================================
+    out["technical_score"] = compute_technical_score(out)
+
     return out
-
-
-def technical_score(f: pd.DataFrame) -> pd.Series:
-    """Layer 5 — Technical Structure Score, 0-100.
-
-    A trend-template style composite of the per-indicator columns already
-    computed above. Four weighted sub-components, each normalised to 0-100:
-
-        trend      (35%)  price above the EMA stack, EMAs stacked in order,
-                          supertrend up  — is the stock in an uptrend?
-        momentum   (30%)  RSI in the constructive 50-70 band, positive ROC,
-                          MACD histogram > 0, ADX confirming a real trend
-        position   (20%)  proximity to the 252-day high (leadership)
-        participation (15%) above-average volume backing the move
-
-    Every sub-score degrades gracefully to a neutral 50 when its inputs are
-    NaN (early history, insufficient lookback) so the blend never propagates
-    NaN into the warehouse. Returns a float Series aligned to `f`'s index.
-    """
-    idx = f.index
-
-    def clip01(s):
-        return s.clip(0.0, 1.0)
-
-    # ---- Trend (0-1): EMA stack alignment + supertrend -------------------
-    above = (
-        f["above_ema20"].astype(float)
-        + f["above_ema50"].astype(float)
-        + f["above_ema150"].astype(float)
-        + f["above_ema200"].astype(float)
-    ) / 4.0
-    stacked = (
-        (f["ema20"] > f["ema50"]).astype(float)
-        + (f["ema50"] > f["ema150"]).astype(float)
-        + (f["ema150"] > f["ema200"]).astype(float)
-    ) / 3.0
-    st_up = (f["supertrend_dir"] > 0).astype(float)
-    trend = clip01(0.5 * above + 0.35 * stacked + 0.15 * st_up)
-
-    # ---- Momentum (0-1): RSI band + ROC + MACD hist + ADX ----------------
-    # RSI is best in the 50-70 constructive zone; taper above/below.
-    rsi = f["rsi14"]
-    rsi_band = pd.Series(np.where(
-        rsi >= 50,
-        1.0 - (rsi - 60).abs() / 40.0,          # peak near 60, fall off either side
-        rsi / 50.0 * 0.5,                        # below 50 scales 0->0.5
-    ), index=idx)
-    rsi_band = clip01(rsi_band.fillna(0.5))
-    roc_pos = clip01((f["roc10"].fillna(0) / 15.0 + 0.5))   # +15% roc -> ~1
-    macd_pos = (f["macd_hist"].fillna(0) > 0).astype(float)
-    adx = clip01((f["adx14"].fillna(0) - 15.0) / 25.0)      # 15->0, 40->1
-    momentum = clip01(0.35 * rsi_band + 0.25 * roc_pos + 0.20 * macd_pos + 0.20 * adx)
-
-    # ---- Position (0-1): distance below the 252d high --------------------
-    roll_high = f["close"].rolling(252, min_periods=20).max()
-    off_high = (roll_high - f["close"]) / roll_high            # 0 at the high
-    position = clip01(1.0 - off_high.fillna(0.5) / 0.25)       # within 25% of high -> >0
-    position = position.where(~f["new_high_252"].fillna(False), 1.0)
-
-    # ---- Participation (0-1): volume vs its 20d average ------------------
-    participation = clip01((f["volume_ratio"].fillna(1.0) - 0.5) / 1.5)  # 1x->~0.33, 2x->1
-
-    score = (
-        0.35 * trend
-        + 0.30 * momentum
-        + 0.20 * position
-        + 0.15 * participation
-    ) * 100.0
-    return score.clip(0.0, 100.0).astype(float)

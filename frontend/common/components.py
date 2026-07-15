@@ -228,9 +228,11 @@ def command_bar(active=None):
             router.goto("funnel")
     with c5:
         st.markdown('<div style="height:1.55rem"></div>', unsafe_allow_html=True)
-        if st.button("↩ LATEST", key="nav_latest", width="stretch") and dates:
-            st.session_state["asof_date"] = dates[0]
-            st.rerun()
+
+        def _reset_to_latest():
+            st.session_state.pop("asof_date", None)
+
+        st.button("↩ LATEST", key="nav_latest", width="stretch", on_click=_reset_to_latest)
 
 
 def layer_heading(layer):
