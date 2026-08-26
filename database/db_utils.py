@@ -17,7 +17,62 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
 
 
+def ensure_database_ready():
+    """Ensure DB directory and DuckDB file are available. On cloud initial run, if missing, download or initialize schema."""
+    if os.path.exists(config.DB_PATH):
+        return
+
+    os.makedirs(os.path.dirname(config.DB_PATH), exist_ok=True)
+    zip_path = config.DB_PATH + ".zip"
+    if os.path.exists(zip_path):
+        import zipfile
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(os.path.dirname(config.DB_PATH))
+        return
+
+    download_url = None
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and "DB_DOWNLOAD_URL" in st.secrets:
+            download_url = st.secrets["DB_DOWNLOAD_URL"]
+    except Exception:
+        pass
+
+    if not download_url:
+        download_url = os.environ.get("DB_DOWNLOAD_URL")
+
+    if download_url:
+        import urllib.request, zipfile
+        temp_zip = config.DB_PATH + ".dl.zip"
+        try:
+            urllib.request.urlretrieve(download_url, temp_zip)
+            with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
+                zip_ref.extractall(os.path.dirname(config.DB_PATH))
+            if os.path.exists(temp_zip):
+                os.remove(temp_zip)
+            return
+        except Exception as e:
+            print(f"Warning: Failed to download database: {e}")
+
+    try:
+        con = duckdb.connect(config.DB_PATH)
+        if os.path.exists(config.SCHEMA_FILE):
+            with open(config.SCHEMA_FILE, "r") as f:
+                schema_sql = f.read()
+            lines = [line for line in schema_sql.splitlines() if not line.strip().startswith("--") and line.strip()]
+            statements = [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
+            for stmt in statements:
+                try:
+                    con.execute(stmt)
+                except Exception:
+                    pass
+        con.close()
+    except Exception as e:
+        print(f"Warning: Database initialization failed: {e}")
+
+
 def get_connection(read_only: bool = False) -> duckdb.DuckDBPyConnection:
+    ensure_database_ready()
     return duckdb.connect(config.DB_PATH, read_only=read_only)
 
 
